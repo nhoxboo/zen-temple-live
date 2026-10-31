@@ -1,0 +1,12 @@
+services:
+  zen-temple-live:
+    build: .
+    container_name: zen-temple-live
+    restart: unless-stopped
+    ports:
+      - "3300:3300"
+    environment:
+      - PORT=3300
+      - HOST=0.0.0.0
+      - TEMPLE_TITLE=Chánh Điện Tịnh Tâm
+      - TEMPLE_SUBTITLE=Nam Mô A Di Đà Phật

@@ -1,48 +1,85 @@
-// Chánh Điện Tịnh Tâm — live server
+// Zen Temple Live (Chánh Điện Tịnh Tâm Pro) — Live Server
 // Runs on the streaming PC. Serves the overlay + control panel, listens to a TikTok LIVE room,
 // keeps the list of seated viewers, generates Vietnamese voice lines with Edge TTS and pushes
 // everything to the overlay over WebSocket.
-//
-//   cd live && npm install && node server.mjs        → http://localhost:3000/live/control.html
-//
+
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');            // repo root: serves /assets, /live
+const ROOT = path.resolve(__dirname, '..'); // repo root: serves /assets, /live
+
+// --- Lightweight .env loader ---
+function loadEnv() {
+  const envFiles = [path.join(ROOT, '.env'), path.join(__dirname, '.env')];
+  for (const envFile of envFiles) {
+    if (fs.existsSync(envFile)) {
+      try {
+        const content = fs.readFileSync(envFile, 'utf8');
+        for (const line of content.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          const eq = trimmed.indexOf('=');
+          if (eq > 0) {
+            const key = trimmed.slice(0, eq).trim();
+            const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+            if (!process.env[key]) process.env[key] = val;
+          }
+        }
+      } catch {}
+    }
+  }
+}
+loadEnv();
+
 const TTS_DIR = path.join(__dirname, 'tts');
-fs.mkdirSync(TTS_DIR, { recursive: true });
-for (const f of fs.readdirSync(TTS_DIR)) { try { fs.unlinkSync(path.join(TTS_DIR, f)); } catch {} }
-const PORT = +process.env.PORT || 3000;
+const CACHE_DIR = path.join(TTS_DIR, 'cache');
+fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+// Clean temporary mp3 files at startup (preserve cache)
+for (const f of fs.readdirSync(TTS_DIR)) {
+  if (f.startsWith('tts_') && f.endsWith('.mp3')) {
+    try { fs.unlinkSync(path.join(TTS_DIR, f)); } catch {}
+  }
+}
+
+const DEFAULT_PORT = +process.env.PORT || 3300;
+const HOST = process.env.HOST || '127.0.0.1';
 
 /* ------------------------------------------------------------------ state */
 const settings = {
-  title: 'Chánh Điện Tịnh Tâm',
-  subtitle: 'Nam Mô A Di Đà Phật',
-  voice: 'vi-VN-NamMinhNeural',      // or vi-VN-HoaiMyNeural
-  pitch: -18,                        // Hz
-  rate: -20,                         // %
+  title: process.env.TEMPLE_TITLE || 'Chánh Điện Tịnh Tâm',
+  subtitle: process.env.TEMPLE_SUBTITLE || 'Nam Mô A Di Đà Phật',
+  voice: process.env.DEFAULT_VOICE || 'vi-VN-NamMinhNeural', // or vi-VN-HoaiMyNeural
+  pitch: +process.env.DEFAULT_PITCH || -18,                   // Hz
+  rate: +process.env.DEFAULT_RATE || -20,                    // %
   music: true, mo: true, moBpm: 52,
   autoChant: true, chantEveryMin: 3,
-  seatMode: 'auto',                  // auto | 24 | 36 | 64 | 100
-  joinOnEnter: false,                // also seat viewers who only enter the room
+  seatMode: 'auto',                                          // auto | 24 | 36 | 64 | 100
+  joinOnEnter: false,                                        // also seat viewers who only enter the room
   gifts: { readAll: true, minDiamonds: 1 },
 };
-const viewers = new Map();           // id -> { id, name, skin, avatar, coins, joinedAt, lastAt, lastText, lastTextAt, demo }
+const viewers = new Map(); // id -> { id, name, skin, avatar, coins, joinedAt, lastAt, lastText, lastTextAt, demo }
 const startedAt = Date.now();
 let tiktok = null, tiktokState = { status: 'idle', uniqueId: '', error: '' };
 const log = [];
-function addLog(s){ const line = `[${new Date().toLocaleTimeString('vi-VN')}] ${s}`; log.push(line); if (log.length > 300) log.shift(); broadcast({ t:'log', line }, 'control'); console.log(line); }
+function addLog(s){
+  const line = `[${new Date().toLocaleTimeString('vi-VN')}] ${s}`;
+  log.push(line);
+  if (log.length > 300) log.shift();
+  broadcast({ t:'log', line }, 'control');
+  console.log(line);
+}
 
 const CAPS = [24, 36, 64, 100];
 function capacity(){ if (settings.seatMode !== 'auto') return +settings.seatMode; const n = viewers.size; return CAPS.find(c => n <= c) || 100; }
 
 /* skins: sprites that exist in /assets. Walking strips exist for man / woman / granny. */
-// A comment changes the outfit only when it IS the keyword (≤ 3 words), so "Nam mô A Di Đà Phật" never reads as "nam".
 const SKIN_WORDS = [
   ['master', ['cao tăng','cao tang']], ['monk', ['sư','su','sư thầy','su thay','thầy','thay']], ['nun', ['ni','ni cô','ni co','sư cô','su co']],
   ['child', ['tiểu','tieu','chú tiểu','chu tieu','bé','be']], ['granny', ['bà','ba','áo nâu','ao nau','cụ','cu']],
@@ -99,8 +136,14 @@ function onGift(id, name, giftName, count, diamonds, avatar){
 }
 
 function pickPrayer(){
-  const P = ['Nguyện cầu gia đạo bình an, vạn sự cát tường', 'Nguyện cầu cha mẹ mạnh khỏe, sống lâu', 'Nguyện hồi hướng công đức cho khắp pháp giới chúng sinh',
-             'Nguyện cầu thân tâm an lạc, phiền não tiêu trừ', 'Nguyện cầu công việc hanh thông, gia đình hạnh phúc'];
+  const P = [
+    'Nguyện cầu gia đạo bình an, vạn sự cát tường',
+    'Nguyện cầu cha mẹ mạnh khỏe, sống lâu trăm tuổi',
+    'Nguyện hồi hướng công đức cho khắp pháp giới chúng sinh',
+    'Nguyện cầu thân tâm an lạc, phiền não tiêu trừ',
+    'Nguyện cầu công việc hanh thông, gia đình hạnh phúc',
+    'Nguyện tiêu trừ nghiệp chướng, phước huệ tăng long'
+  ];
   return P[Math.floor(Math.random() * P.length)];
 }
 const spoken = s => String(s).replace(/[_@.]+/g, ' ').replace(/[^\p{L}\p{N}\s]/gu, '').trim() || 'ẩn danh';
@@ -108,29 +151,81 @@ const spoken = s => String(s).replace(/[_@.]+/g, ' ').replace(/[^\p{L}\p{N}\s]/g
 /* ------------------------------------------------------------------ TTS */
 const ttsQueue = []; let ttsBusy = false, ttsSeq = 0;
 function esc(s){ return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[c])); }
-function say(text, meta = {}){ if (ttsQueue.length >= 15) { addLog('Hàng đợi giọng đọc đầy, bỏ qua 1 câu'); return; } ttsQueue.push({ text: String(text).slice(0, 500), meta }); pumpTTS(); }
+function say(text, meta = {}){
+  if (ttsQueue.length >= 25) { addLog('Hàng đợi giọng đọc đầy, bỏ qua 1 câu'); return; }
+  ttsQueue.push({ text: String(text).slice(0, 500), meta });
+  pumpTTS();
+}
+
 async function pumpTTS(){
-  if (ttsBusy || !ttsQueue.length) return; ttsBusy = true;
+  if (ttsBusy || !ttsQueue.length) return;
+  ttsBusy = true;
   const { text, meta } = ttsQueue.shift();
+
   try {
-    const file = `tts_${Date.now()}_${++ttsSeq}.mp3`;
-    const tts = new MsEdgeTTS();
-    await tts.setMetadata(settings.voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-    const { audioStream } = tts.toStream(esc(text), { pitch: `${settings.pitch >= 0 ? '+' : ''}${settings.pitch}Hz`, rate: `${settings.rate >= 0 ? '+' : ''}${settings.rate}%` });
-    const chunks = [];
-    await new Promise((res, rej) => { audioStream.on('data', c => chunks.push(c)); audioStream.on('close', res); audioStream.on('error', rej); });
-    try { tts.close(); } catch {}
-    fs.writeFileSync(path.join(TTS_DIR, file), Buffer.concat(chunks));
+    const isChant = meta.tag === 'chant';
+    let file = '';
+    let cached = false;
+
+    if (isChant) {
+      const hash = crypto.createHash('md5').update(`${text}_${settings.voice}_${settings.pitch}_${settings.rate}`).digest('hex');
+      file = `cache/chant_${hash}.mp3`;
+      const fullPath = path.join(TTS_DIR, file);
+      if (fs.existsSync(fullPath) && fs.statSync(fullPath).size > 1000) {
+        cached = true;
+      }
+    }
+
+    if (!cached) {
+      const outRel = isChant ? file : `tts_${Date.now()}_${++ttsSeq}.mp3`;
+      const fullOut = path.join(TTS_DIR, outRel);
+      const tts = new MsEdgeTTS();
+      await tts.setMetadata(settings.voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+      const { audioStream } = tts.toStream(esc(text), {
+        pitch: `${settings.pitch >= 0 ? '+' : ''}${settings.pitch}Hz`,
+        rate: `${settings.rate >= 0 ? '+' : ''}${settings.rate}%`
+      });
+      const chunks = [];
+      await new Promise((res, rej) => {
+        audioStream.on('data', c => chunks.push(c));
+        audioStream.on('close', res);
+        audioStream.on('error', rej);
+      });
+      try { tts.close(); } catch {}
+      await fs.promises.writeFile(fullOut, Buffer.concat(chunks));
+      file = outRel;
+    }
+
     broadcast({ t:'tts', url: `/live/tts/${file}`, text, ...meta });
-    const old = fs.readdirSync(TTS_DIR).sort(); while (old.length > 40) { try { fs.unlinkSync(path.join(TTS_DIR, old.shift())); } catch {} }
-  } catch (e) { addLog('TTS lỗi: ' + (e?.message || e)); }
-  ttsBusy = false; setTimeout(pumpTTS, 50);
+
+    // Non-blocking cleanup of temporary audio files
+    cleanOldTTSFiles();
+  } catch (e) {
+    addLog('TTS lỗi: ' + (e?.message || e));
+  }
+  ttsBusy = false;
+  setTimeout(pumpTTS, 50);
+}
+
+let isCleaning = false;
+async function cleanOldTTSFiles(){
+  if (isCleaning) return;
+  isCleaning = true;
+  try {
+    const files = await fs.promises.readdir(TTS_DIR);
+    const dynamicFiles = files.filter(f => f.startsWith('tts_') && f.endsWith('.mp3')).sort();
+    while (dynamicFiles.length > 40) {
+      const removeTarget = dynamicFiles.shift();
+      try { await fs.promises.unlink(path.join(TTS_DIR, removeTarget)); } catch {}
+    }
+  } catch {}
+  isCleaning = false;
 }
 
 const CHANTS = [
   'Nam mô Bổn Sư Thích Ca Mâu Ni Phật. Nguyện đem công đức này, hướng về khắp tất cả, đệ tử và chúng sinh, đều trọn thành Phật đạo.',
   'Nam mô A Di Đà Phật. Nguyện sanh Tây Phương Tịnh Độ trung, cửu phẩm liên hoa vi phụ mẫu.',
-  'Nam mô Đại Bi Quán Thế Âm Bồ Tát. Nguyện cho tất cả chúng sinh thân tâm an lạc, tai qua nạn khỏi.',
+  'Nam mô Đại Bi Quán Thế Âm Bồ Tát. Nguyện cho tất cả chúng sinh thân tâm an lạc, tai qua nạn khỏi, cát tường như ý.',
   'Quán Tự Tại Bồ Tát hành thâm Bát Nhã Ba La Mật Đa thời, chiếu kiến ngũ uẩn giai không, độ nhất thiết khổ ách.',
 ];
 let chantIdx = 0, chantTimer = null;
@@ -154,7 +249,7 @@ async function connectTikTok(uniqueId){
     conn.on(WebcastEvent.CHAT, d => onChat(d.user?.uniqueId || d.user?.userId, nm(d.user), d.comment, av(d.user)));
     conn.on(WebcastEvent.GIFT, d => {
       const type = d.giftDetails?.giftType ?? d.extendedGiftInfo?.type;
-      if (type === 1 && !d.repeatEnd) return;                       // streak still running
+      if (type === 1 && !d.repeatEnd) return; // streak still running
       const gname = d.giftDetails?.giftName || d.extendedGiftInfo?.name || 'quà';
       const dia = d.giftDetails?.diamondCount ?? d.extendedGiftInfo?.diamond_count ?? 1;
       onGift(d.user?.uniqueId || d.user?.userId, nm(d.user), gname, d.repeatCount || 1, dia, av(d.user));
@@ -207,7 +302,6 @@ function onControl(m){
   }
 }
 
-// Only known keys, right types, sane ranges: the panel is local, but nothing from the socket is trusted blindly.
 const SETTING_RULES = {
   title: v => String(v).slice(0, 40), subtitle: v => String(v).slice(0, 60),
   voice: v => ['vi-VN-NamMinhNeural', 'vi-VN-HoaiMyNeural'].includes(v) ? v : settings.voice,
@@ -220,8 +314,11 @@ function applySettings(o){ for (const [k, fn] of Object.entries(SETTING_RULES)) 
 
 /* ----------------------------------------------------------------- bots */
 let botTimer = null;
-const BOT_LINES = ['Nam mô A Di Đà Phật', 'Nam mô Bổn Sư Thích Ca Mâu Ni Phật', 'Cầu cho gia đình bình an', 'Con xin thành tâm sám hối', 'nữ', 'nam', 'bà',
-  'Nguyện cầu cha mẹ mạnh khỏe', 'Mô Phật, an lạc quá', 'Chúc mọi người một ngày bình an', 'sư', 'Cầu công việc hanh thông'];
+const BOT_LINES = [
+  'Nam mô A Di Đà Phật', 'Nam mô Bổn Sư Thích Ca Mâu Ni Phật', 'Cầu cho gia đình bình an',
+  'Con xin thành tâm sám hối', 'nữ', 'nam', 'bà', 'Nguyện cầu cha mẹ mạnh khỏe',
+  'Mô Phật, an lạc quá', 'Chúc mọi người một ngày bình an', 'sư', 'Cầu công việc hanh thông'
+];
 function setBots(on, n, pace){
   clearInterval(botTimer); botTimer = null;
   if (on){
@@ -244,57 +341,119 @@ function setBots(on, n, pace){
   broadcast({ t:'bots', on }, 'control');
 }
 
-/* -------------------------------------------------------------- server */
-// Security notes (this file is meant to be shared publicly):
-//  • listens on 127.0.0.1 only; nothing is reachable from the LAN or internet unless HOST is changed on purpose
-//  • Host header must be localhost/127.0.0.1 (blocks DNS-rebinding pages from talking to the server)
-//  • WebSocket only accepts pages served by this server (Origin check), so other sites open in the
-//    same browser cannot send control commands
-//  • static files: only /assets and /live, no dot-files, no node_modules, no server source, no path escapes
-//  • no TikTok password, cookie or session is ever used or stored; only public room events are read
-const HOST = process.env.HOST || '127.0.0.1';
-const MIME = { '.html':'text/html; charset=utf-8', '.js':'text/javascript', '.css':'text/css', '.json':'application/json',
-  '.png':'image/png', '.jpg':'image/jpeg', '.webp':'image/webp', '.mp3':'audio/mpeg', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
-const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]);
-const okHost = h => ALLOWED_HOSTS.has(String(h || '').toLowerCase());
+/* -------------------------------------------------------------- HTTP & WS Server */
+let activePort = DEFAULT_PORT;
+const allowedHosts = new Set();
+function updateAllowedHosts(port) {
+  allowedHosts.clear();
+  allowedHosts.add(`localhost:${port}`);
+  allowedHosts.add(`127.0.0.1:${port}`);
+  allowedHosts.add(`[::1]:${port}`);
+  allowedHosts.add('localhost');
+  allowedHosts.add('127.0.0.1');
+}
+updateAllowedHosts(activePort);
+
+const okHost = h => {
+  if (!h) return false;
+  const hostLower = String(h).toLowerCase();
+  return allowedHosts.has(hostLower) || hostLower.startsWith('localhost:') || hostLower.startsWith('127.0.0.1:');
+};
+
+const MIME = {
+  '.html':'text/html; charset=utf-8', '.js':'text/javascript', '.css':'text/css', '.json':'application/json',
+  '.png':'image/png', '.jpg':'image/jpeg', '.webp':'image/webp', '.mp3':'audio/mpeg', '.svg':'image/svg+xml', '.ico':'image/x-icon'
+};
 const SEP = path.sep;
 function resolveStatic(urlPath){
   let p = urlPath === '/' ? '/live/control.html' : urlPath;
   if (!/^\/(assets|live)\//.test(p)) return null;
   if (p.split('/').some(seg => seg.startsWith('.') || seg === 'node_modules')) return null;
-  if (/\.(mjs|json|md|log)$/i.test(p) && !p.startsWith('/assets/')) return null;      // never serve server code / package files
+  if (/\.(mjs|json|md|log)$/i.test(p) && !p.startsWith('/assets/')) return null;
   const file = path.normalize(path.join(ROOT, p));
   if (!file.startsWith(ROOT + SEP)) return null;
   return file;
 }
+
 const server = http.createServer((req, res) => {
   if (!okHost(req.headers.host)) { res.writeHead(421).end('wrong host'); return; }
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405).end(); return; }
   let p; try { p = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { res.writeHead(400).end(); return; }
+
+  // API Status endpoint
+  if (p === '/api/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', port: activePort, viewers: viewers.size, tiktok: tiktokState }));
+    return;
+  }
+
   const file = resolveStatic(p);
   if (!file) { res.writeHead(404).end('not found'); return; }
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404).end('not found'); return; }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-      'Cache-Control': p.startsWith('/live/tts/') ? 'no-store' : 'no-cache', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+    res.writeHead(200, {
+      'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
+      'Cache-Control': p.startsWith('/live/tts/cache/') ? 'public, max-age=86400' : (p.startsWith('/live/tts/') ? 'no-store' : 'no-cache'),
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer'
+    });
     if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(file).pipe(res);
   });
 });
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024,
+
+const wss = new WebSocketServer({
+  server, path: '/ws', maxPayload: 64 * 1024,
   verifyClient: ({ origin, req }) => {
     if (!okHost(req.headers.host)) return false;
-    if (!origin) return true;                                   // OBS / non-browser clients send no Origin
+    if (!origin) return true; // OBS / non-browser clients send no Origin
     try { return okHost(new URL(origin).host); } catch { return false; }
-  } });
-function broadcast(msg, only){ const s = JSON.stringify(msg); for (const c of wss.clients) if (c.readyState === 1 && (!only || c.role === only)) c.send(s); }
+  }
+});
+
+function broadcast(msg, only){
+  const s = JSON.stringify(msg);
+  for (const c of wss.clients) if (c.readyState === 1 && (!only || c.role === only)) c.send(s);
+}
+
 wss.on('connection', (ws, req) => {
   ws.role = new URL(req.url, 'http://x').searchParams.get('role') === 'control' ? 'control' : 'overlay';
   ws.send(JSON.stringify(snapshot()));
   if (ws.role === 'control') ws.send(JSON.stringify({ t:'logs', lines: log }));
   ws.on('message', buf => {
-    if (ws.role !== 'control') return;                          // overlays only listen
+    if (ws.role !== 'control') return; // overlays only listen
     try { const m = JSON.parse(buf); if (m && m.t === 'ctl') onControl(m); } catch (e) { addLog('Lệnh lỗi: ' + e.message); }
   });
 });
-server.listen(PORT, HOST, () => addLog(`Server chạy tại http://localhost:${PORT}  ·  Bảng điều khiển: http://localhost:${PORT}/live/control.html  ·  Overlay: http://localhost:${PORT}/live/overlay.html`));
+
+function startServer(port, maxAttempts = 10) {
+  server.once('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.warn(`[CẢNH BÁO] Cổng ${port} đang bận! Đang tự động chuyển sang cổng kế tiếp...`);
+      if (maxAttempts > 0) {
+        startServer(port + 1, maxAttempts - 1);
+      } else {
+        console.error(`[LỖI] Không tìm được cổng khả dụng.`);
+        process.exit(1);
+      }
+    } else {
+      console.error('[LỖI] Server gặp sự cố:', err);
+    }
+  });
+
+  server.listen(port, HOST, () => {
+    activePort = port;
+    updateAllowedHosts(activePort);
+    const msg = `\n======================================================\n` +
+      `  ZEN TEMPLE LIVE (CHÁNH ĐIỆN TỊNH TÂM PRO) ĐÃ KHỞI CHẠY!  \n` +
+      `======================================================\n` +
+      `  • Cổng Server:       http://localhost:${activePort}\n` +
+      `  • Bảng Điều Khiển:   http://localhost:${activePort}/live/control.html\n` +
+      `  • Màn Hình Overlay:  http://localhost:${activePort}/live/overlay.html (1080x1920)\n` +
+      `======================================================\n`;
+    console.log(msg);
+    addLog(`Server chạy tại port ${activePort}`);
+  });
+}
+
+startServer(DEFAULT_PORT);
