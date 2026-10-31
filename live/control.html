@@ -3,10 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bảng điều khiển · Chánh Điện Tịnh Tâm</title>
+<title>Bảng điều khiển · Zen Temple Live Pro</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif:wght@600;700&family=Be+Vietnam+Pro:wght@400;500;600&display=swap">
 <style>
-/* Layout: three columns of cards (connection · interaction · sound/scene) over a status bar; collapses to one column on narrow windows. */
 :root{
   --bg:#140b07; --card:#1f120b; --card2:#2a180e; --fg:#f3e5cb; --muted:#b39a78; --line:#4a2e1a;
   --gold:#e2b04f; --red:#8f2a1a; --green:#2f7a4a; --display:"Noto Serif",Georgia,serif; --body:"Be Vietnam Pro",system-ui,sans-serif;
@@ -18,7 +17,7 @@ header{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:baseline;justify-co
 h1{font-family:var(--display);font-size:24px;margin:0;color:var(--gold)}
 .status{display:flex;gap:10px;flex-wrap:wrap}
 .chip{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:4px 12px;font-size:13px;font-variant-numeric:tabular-nums}
-.chip.ok{border-color:var(--green);color:#9fe0b4}.chip.bad{border-color:#a33;color:#f3a3a3}
+.chip.ok{border-color:var(--green);color:#9fe0b4}.chip.bad{border-color:#a33;color:#f3a3a3}.chip.warn{border-color:var(--gold);color:#ffd98a}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px;align-items:start}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;display:grid;gap:10px;min-width:0}
 .card h2{margin:0;font:600 15px var(--body);letter-spacing:.04em;text-transform:uppercase;color:var(--gold)}
@@ -41,17 +40,27 @@ button.red{background:var(--red);border-color:#b84a33}
 #people td{padding:5px 8px;border-bottom:1px solid #2e1c10}
 #people td:last-child{text-align:right;color:var(--gold);font-variant-numeric:tabular-nums}
 #log{height:220px;overflow:auto;background:#0b0604;border:1px solid var(--line);border-radius:10px;padding:8px;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.auth-bar{background:#23130a;border:1px solid var(--gold);border-radius:10px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.auth-bar input{width:160px;padding:6px 10px}
 </style>
 </head>
 <body>
 <header>
-  <h1>Bảng điều khiển · Chánh Điện Tịnh Tâm</h1>
+  <h1>🌸 Zen Temple Live · Bảng Điều Khiển Pro</h1>
   <div class="status">
     <span class="chip" id="srv">Server: …</span>
+    <span class="chip" id="authChip">Quyền: …</span>
     <span class="chip" id="tt">TikTok: chưa kết nối</span>
     <span class="chip" id="cnt">0 người</span>
   </div>
 </header>
+
+<div class="auth-bar" id="authBar">
+  <span style="font-weight:600;color:var(--gold)">🔐 Mã PIN Quản Trị Từ Xa:</span>
+  <input type="password" id="adminPin" placeholder="Nhập mã PIN...">
+  <button class="gold" id="btnSavePin">Xác thực & Lưu</button>
+  <span class="hint" id="authNotice" style="flex:1">Mã PIN dùng khi truy cập từ xa qua internet để bảo vệ kênh.</span>
+</div>
 
 <div class="grid">
   <section class="card">
@@ -124,12 +133,30 @@ button.red{background:var(--red);border-color:#b84a33}
   <h2>Nhật ký</h2>
   <div id="log" aria-live="polite"></div>
 </section>
-<footer class="hint" style="margin-top:14px;text-align:center">Chánh Điện Online · mã nguồn mở MIT · thực hiện bởi Kent Juno</footer>
+<footer class="hint" style="margin-top:14px;text-align:center">Zen Temple Live Pro · Mã nguồn mở MIT · Phát triển bởi nhoxboo</footer>
 
 <script>
 const $ = id => document.getElementById(id);
 let ws = null;
-const send = (cmd, extra={}) => ws?.readyState===1 && ws.send(JSON.stringify({ t:'ctl', cmd, ...extra }));
+let isAuthenticated = false;
+
+// Auto detect base URL & protocol for WebSocket (supports Localhost, HTTPS and Caddy proxy)
+function getWsUrl() {
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const basePath = location.pathname.includes('/zen/') ? '/zen' : '';
+  const pin = localStorage.getItem('zen_pin') || '';
+  const pinParam = pin ? `&pin=${encodeURIComponent(pin)}` : '';
+  return `${wsProto}//${location.host}${basePath}/ws?role=control${pinParam}`;
+}
+
+const send = (cmd, extra={}) => {
+  if (ws?.readyState === 1) {
+    ws.send(JSON.stringify({ t:'ctl', cmd, ...extra }));
+  } else {
+    logLine('⚠️ Chưa kết nối tới server.');
+  }
+};
+
 function logLine(s){ const el=$('log'); el.textContent += s + '\n'; el.scrollTop = el.scrollHeight; }
 const SETTING_IDS = ['voice','pitch','rate','music','mo','autoChant','moBpm','chantEveryMin','title','subtitle','seatMode','joinOnEnter'];
 function fillSettings(s){ for (const k of SETTING_IDS){ const el=$(k); if (!el || s[k]===undefined) continue; if (el.type==='checkbox') el.checked=!!s[k]; else el.value=s[k]; } }
@@ -146,28 +173,79 @@ function setTT(st){
   const el=$('tt'); el.className='chip ' + (st.status==='connected'?'ok':st.status==='error'?'bad':'');
   el.textContent = st.status==='connected' ? `TikTok: @${st.uniqueId} ✓` : st.status==='connecting' ? `TikTok: đang kết nối @${st.uniqueId}…` : st.status==='error' ? 'TikTok: lỗi kết nối' : 'TikTok: chưa kết nối';
 }
+
+function updateAuthUI(authed, msg) {
+  isAuthenticated = authed;
+  const chip = $('authChip');
+  if (authed) {
+    chip.textContent = 'Quyền: Quản trị ✓';
+    chip.className = 'chip ok';
+    $('authNotice').textContent = '✅ Đã xác thực quyền điều khiển từ xa.';
+  } else {
+    chip.textContent = 'Quyền: Chưa xác thực';
+    chip.className = 'chip warn';
+    if (msg) $('authNotice').textContent = '⚠️ ' + msg;
+  }
+}
+
 function connect(){
-  ws = new WebSocket(`ws://${location.host}/ws?role=control`);
-  ws.onopen = () => { $('srv').textContent='Server: đang chạy'; $('srv').className='chip ok'; };
-  ws.onclose = () => { $('srv').textContent='Server: mất kết nối'; $('srv').className='chip bad'; setTimeout(connect, 2000); };
+  const url = getWsUrl();
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    $('srv').textContent='Server: đang chạy'; $('srv').className='chip ok';
+    const pin = localStorage.getItem('zen_pin');
+    if (pin) ws.send(JSON.stringify({ t: 'auth', pin }));
+  };
+  ws.onclose = () => {
+    $('srv').textContent='Server: mất kết nối'; $('srv').className='chip bad';
+    updateAuthUI(false);
+    setTimeout(connect, 2000);
+  };
   ws.onmessage = e => {
-    const m = JSON.parse(e.data);
-    if (m.t==='state'){ fillSettings(m.settings); setTT(m.tiktok); people.clear(); for (const v of m.viewers) people.set(v.id,v); renderPeople(); }
-    else if (m.t==='logs'){ $('log').textContent=''; m.lines.forEach(logLine); }
-    else if (m.t==='log') logLine(m.line);
-    else if (m.t==='tiktok') setTT(m);
-    else if (m.t==='join'){ people.set(m.v.id,m.v); renderPeople(); }
-    else if (m.t==='leave'){ people.delete(m.id); renderPeople(); }
-    else if (m.t==='gift'){ const p=people.get(m.id); if(p){ p.coins=m.total; renderPeople(); } }
-    else if (m.t==='bots') $('btnBots').textContent = m.on ? 'Tắt bot' : 'Bật bot';
+    try {
+      const m = JSON.parse(e.data);
+      if (m.t === 'auth_status') {
+        updateAuthUI(m.authenticated, m.error || m.message);
+      } else if (m.t==='state'){
+        fillSettings(m.settings); setTT(m.tiktok); people.clear();
+        for (const v of m.viewers) people.set(v.id,v);
+        renderPeople();
+        if (m.authenticated !== undefined) updateAuthUI(m.authenticated);
+      }
+      else if (m.t==='logs'){ $('log').textContent=''; m.lines.forEach(logLine); }
+      else if (m.t==='log') logLine(m.line);
+      else if (m.t==='tiktok') setTT(m);
+      else if (m.t==='join'){ people.set(m.v.id,m.v); renderPeople(); }
+      else if (m.t==='leave'){ people.delete(m.id); renderPeople(); }
+      else if (m.t==='gift'){ const p=people.get(m.id); if(p){ p.coins=m.total; renderPeople(); } }
+      else if (m.t==='bots') $('btnBots').textContent = m.on ? 'Tắt bot' : 'Bật bot';
+      else if (m.t==='error') logLine('❌ ' + m.message);
+    } catch (err) {}
   };
 }
+
+// PIN management
+const savedPin = localStorage.getItem('zen_pin');
+if (savedPin) $('adminPin').value = savedPin;
+$('btnSavePin').onclick = () => {
+  const pin = $('adminPin').value.trim();
+  localStorage.setItem('zen_pin', pin);
+  if (ws?.readyState === 1) {
+    ws.send(JSON.stringify({ t: 'auth', pin }));
+  } else {
+    connect();
+  }
+};
+
 connect();
 
 $('btnConnect').onclick = () => send('connect', { uniqueId: $('uid').value });
 $('uid').onkeydown = e => { if (e.key==='Enter') send('connect', { uniqueId: $('uid').value }); };
 $('btnDisconnect').onclick = () => send('disconnect');
-$('btnOverlay').onclick = () => window.open('/live/overlay.html', 'overlay916', 'width=540,height=960');
+$('btnOverlay').onclick = () => {
+  const basePath = location.pathname.includes('/zen/') ? '/zen' : '';
+  window.open(`${basePath}/live/overlay.html`, 'overlay916', 'width=540,height=960');
+};
 $('btnChat').onclick = () => send('chat', { name: $('simName').value, text: $('simText').value });
 document.querySelectorAll('[data-gift]').forEach(b => b.onclick = () => send('gift', { name: $('simName').value, gift: b.dataset.gift, diamonds: +b.dataset.dia, count: 1 }));
 document.querySelectorAll('[data-fill]').forEach(b => b.onclick = () => send('fill', { n: +b.dataset.fill }));

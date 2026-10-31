@@ -89,10 +89,11 @@ function fit(){ const s = Math.min(innerWidth/1080, innerHeight/1920); stage.sty
 addEventListener('resize', fit); fit();
 
 /* ======================= assets ======================= */
+const BASE = location.pathname.includes('/zen/') ? '/zen' : '';
 const A = {};
-const IMG = { hall:'/assets/hall.jpg', monk:'/assets/c_monk.png', nun:'/assets/c_nun.png', granny:'/assets/c_granny.png', man:'/assets/c_man.png',
-  woman:'/assets/c_woman.png', child:'/assets/c_child.png', anim_man:'/assets/anim_man.png', anim_woman:'/assets/anim_woman.png', anim_granny:'/assets/anim_granny.png',
-  lotus:'/assets/fx_lotus.png', halo:'/assets/fx_halo.png', bell:'/assets/fx_bell.png', incense:'/assets/fx_incense.png', petal:'/assets/fx_petal.png' };
+const IMG = { hall: BASE+'/assets/hall.jpg', monk: BASE+'/assets/c_monk.png', nun: BASE+'/assets/c_nun.png', granny: BASE+'/assets/c_granny.png', man: BASE+'/assets/c_man.png',
+  woman: BASE+'/assets/c_woman.png', child: BASE+'/assets/c_child.png', anim_man: BASE+'/assets/anim_man.png', anim_woman: BASE+'/assets/anim_woman.png', anim_granny: BASE+'/assets/anim_granny.png',
+  lotus: BASE+'/assets/fx_lotus.png', halo: BASE+'/assets/fx_halo.png', bell: BASE+'/assets/fx_bell.png', incense: BASE+'/assets/fx_incense.png', petal: BASE+'/assets/fx_petal.png' };
 for (const [k,src] of Object.entries(IMG)){ const im=new Image(); im.src=src; A[k]=im; }
 const ANIM = { man:{fw:212,fh:300,seatH:210}, woman:{fw:212,fh:300,seatH:220}, granny:{fw:195,fh:300,seatH:222} };
 const hasAnim = k => ANIM[k] && A['anim_'+k]?.naturalWidth > 0;
@@ -163,7 +164,7 @@ function showChant(text){ document.getElementById('chantText').textContent=text;
 
 /* ======================= audio ======================= */
 let AC=null, master=null, musicGain=null, sfx=null, settings={ music:true, mo:true, moBpm:52 };
-const TRACKS=['/assets/music/music1.mp3','/assets/music/music2.mp3']; let trackIdx=Math.floor(Math.random()*TRACKS.length), musicEl=null;
+const TRACKS=[BASE+'/assets/music/music1.mp3', BASE+'/assets/music/music2.mp3']; let trackIdx=Math.floor(Math.random()*TRACKS.length), musicEl=null;
 document.getElementById('unmute').onclick = e => { e.currentTarget.remove(); startAudio(); };
 function startAudio(){
   AC = new (window.AudioContext||window.webkitAudioContext)();
@@ -215,7 +216,9 @@ function hearts(v,n){ for (let i=0;i<Math.min(6,n);i++) petals.push({x:v.x+(Math
 /* ======================= server link ======================= */
 let ws=null;
 function connect(){
-  ws = new WebSocket(`ws://${location.host}/ws?role=overlay`);
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const basePath = location.pathname.includes('/zen/') ? '/zen' : '';
+  ws = new WebSocket(`${wsProto}//${location.host}${basePath}/ws?role=overlay`);
   const st=document.getElementById('conn');
   ws.onopen=()=>{ st.textContent=''; };
   ws.onclose=()=>{ st.textContent='mất kết nối server… đang thử lại'; setTimeout(connect,2000); };
@@ -232,7 +235,7 @@ function connect(){
       case 'chat': { const v=visitors.get(m.id); if(v){ v.bubble={text:m.text, until:performance.now()+6000}; v.bow=.6; } } break;
       case 'gift': { const v=visitors.get(m.id); if(v){ v.coins=m.total; giftFx(v,m.tier); } renderMerit(); showGift(m); } break;
       case 'like': { const v=visitors.get(m.id); if(v) hearts(v,m.n); } break;
-      case 'tts': queueTTS(m.url); break;
+      case 'tts': queueTTS(m.url.startsWith('/') ? BASE + m.url : m.url); break;
       case 'chant': showChant(m.text); bell(); break;
       case 'bell': bell(true); break;
       case 'mo1': mo(); break;

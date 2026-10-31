@@ -37,6 +37,7 @@ function loadEnv() {
 }
 loadEnv();
 
+const ADMIN_PIN = process.env.ADMIN_PIN || 'nam2026';
 const TTS_DIR = path.join(__dirname, 'tts');
 const CACHE_DIR = path.join(TTS_DIR, 'cache');
 fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -94,7 +95,7 @@ function skinFromText(t){
 const DEFAULT_SKINS = ['man', 'woman', 'woman', 'man', 'granny'];
 
 function pub(v){ return { id:v.id, name:v.name, skin:v.skin, avatar:v.avatar||'', coins:v.coins, demo:!!v.demo }; }
-function snapshot(){ return { t:'state', settings, viewers:[...viewers.values()].map(pub), cap: capacity(), startedAt, tiktok: tiktokState }; }
+function snapshot(authed = false){ return { t:'state', settings, viewers:[...viewers.values()].map(pub), cap: capacity(), startedAt, tiktok: tiktokState, authenticated: authed }; }
 
 function seat(id, name, opts = {}){
   let v = viewers.get(id);
@@ -197,8 +198,6 @@ async function pumpTTS(){
     }
 
     broadcast({ t:'tts', url: `/live/tts/${file}`, text, ...meta });
-
-    // Non-blocking cleanup of temporary audio files
     cleanOldTTSFiles();
   } catch (e) {
     addLog('TTS lỗi: ' + (e?.message || e));
@@ -249,7 +248,7 @@ async function connectTikTok(uniqueId){
     conn.on(WebcastEvent.CHAT, d => onChat(d.user?.uniqueId || d.user?.userId, nm(d.user), d.comment, av(d.user)));
     conn.on(WebcastEvent.GIFT, d => {
       const type = d.giftDetails?.giftType ?? d.extendedGiftInfo?.type;
-      if (type === 1 && !d.repeatEnd) return; // streak still running
+      if (type === 1 && !d.repeatEnd) return;
       const gname = d.giftDetails?.giftName || d.extendedGiftInfo?.name || 'quà';
       const dia = d.giftDetails?.diamondCount ?? d.extendedGiftInfo?.diamond_count ?? 1;
       onGift(d.user?.uniqueId || d.user?.userId, nm(d.user), gname, d.repeatCount || 1, dia, av(d.user));
@@ -280,7 +279,7 @@ function fillDemo(n){
     seat('demo_' + i, name, { demo: true, skin: ['man','woman','woman','man','granny','monk','nun','child'][i % 8] });
   }
 }
-function clearSeats(){ viewers.clear(); broadcast(snapshot()); addLog('Đã làm trống bồ đoàn'); }
+function clearSeats(){ viewers.clear(); broadcast(snapshot(true)); addLog('Đã làm trống bồ đoàn'); }
 
 /* ------------------------------------------------------------- control */
 function onControl(m){
@@ -351,13 +350,18 @@ function updateAllowedHosts(port) {
   allowedHosts.add(`[::1]:${port}`);
   allowedHosts.add('localhost');
   allowedHosts.add('127.0.0.1');
+  allowedHosts.add('nhoxboo.changeip.co');
+  allowedHosts.add('nhoxboo.changeip.co:8000');
 }
 updateAllowedHosts(activePort);
 
 const okHost = h => {
   if (!h) return false;
   const hostLower = String(h).toLowerCase();
-  return allowedHosts.has(hostLower) || hostLower.startsWith('localhost:') || hostLower.startsWith('127.0.0.1:');
+  return allowedHosts.has(hostLower) ||
+         hostLower.includes('nhoxboo.changeip.co') ||
+         hostLower.startsWith('localhost:') ||
+         hostLower.startsWith('127.0.0.1:');
 };
 
 const MIME = {
@@ -366,7 +370,9 @@ const MIME = {
 };
 const SEP = path.sep;
 function resolveStatic(urlPath){
-  let p = urlPath === '/' ? '/live/control.html' : urlPath;
+  let raw = urlPath === '/' ? '/live/control.html' : urlPath;
+  let p = raw.replace(/^\/zen/, '') || '/live/control.html';
+  if (p === '/') p = '/live/control.html';
   if (!/^\/(assets|live)\//.test(p)) return null;
   if (p.split('/').some(seg => seg.startsWith('.') || seg === 'node_modules')) return null;
   if (/\.(mjs|json|md|log)$/i.test(p) && !p.startsWith('/assets/')) return null;
@@ -380,8 +386,8 @@ const server = http.createServer((req, res) => {
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405).end(); return; }
   let p; try { p = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { res.writeHead(400).end(); return; }
 
-  // API Status endpoint
-  if (p === '/api/status') {
+  // API Status endpoint (supports /api/status and /zen/api/status)
+  if (p === '/api/status' || p === '/zen/api/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', port: activePort, viewers: viewers.size, tiktok: tiktokState }));
     return;
@@ -393,7 +399,7 @@ const server = http.createServer((req, res) => {
     if (err || !st.isFile()) { res.writeHead(404).end('not found'); return; }
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-      'Cache-Control': p.startsWith('/live/tts/cache/') ? 'public, max-age=86400' : (p.startsWith('/live/tts/') ? 'no-store' : 'no-cache'),
+      'Cache-Control': p.includes('/live/tts/cache/') ? 'public, max-age=86400' : (p.includes('/live/tts/') ? 'no-store' : 'no-cache'),
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer'
     });
@@ -403,11 +409,20 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({
-  server, path: '/ws', maxPayload: 64 * 1024,
-  verifyClient: ({ origin, req }) => {
-    if (!okHost(req.headers.host)) return false;
-    if (!origin) return true; // OBS / non-browser clients send no Origin
-    try { return okHost(new URL(origin).host); } catch { return false; }
+  noServer: true,
+  maxPayload: 64 * 1024,
+});
+
+server.on('upgrade', (req, socket, head) => {
+  if (!okHost(req.headers.host)) { socket.destroy(); return; }
+  let pathname = '';
+  try { pathname = new URL(req.url, 'http://x').pathname; } catch {}
+  if (pathname === '/ws' || pathname === '/zen/ws') {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  } else {
+    socket.destroy();
   }
 });
 
@@ -417,12 +432,49 @@ function broadcast(msg, only){
 }
 
 wss.on('connection', (ws, req) => {
-  ws.role = new URL(req.url, 'http://x').searchParams.get('role') === 'control' ? 'control' : 'overlay';
-  ws.send(JSON.stringify(snapshot()));
+  const reqUrl = new URL(req.url, 'http://x');
+  ws.role = reqUrl.searchParams.get('role') === 'control' ? 'control' : 'overlay';
+
+  // Remote authentication via PIN or localhost check
+  const forwardedFor = req.headers['x-forwarded-for'];
+  const remoteIp = req.socket.remoteAddress || '';
+  const isLocal = !forwardedFor && (remoteIp === '127.0.0.1' || remoteIp === '::1' || remoteIp === '::ffff:127.0.0.1');
+  const queryPin = reqUrl.searchParams.get('pin');
+
+  ws.authenticated = isLocal || queryPin === ADMIN_PIN;
+
+  ws.send(JSON.stringify(snapshot(ws.authenticated)));
+  ws.send(JSON.stringify({ t:'auth_status', authenticated: ws.authenticated }));
   if (ws.role === 'control') ws.send(JSON.stringify({ t:'logs', lines: log }));
+
   ws.on('message', buf => {
-    if (ws.role !== 'control') return; // overlays only listen
-    try { const m = JSON.parse(buf); if (m && m.t === 'ctl') onControl(m); } catch (e) { addLog('Lệnh lỗi: ' + e.message); }
+    try {
+      const m = JSON.parse(buf);
+      if (m.t === 'auth') {
+        if (m.pin === ADMIN_PIN) {
+          ws.authenticated = true;
+          ws.send(JSON.stringify({ t:'auth_status', authenticated: true }));
+          addLog('🔐 Quản trị viên từ xa đã xác thực mã PIN thành công');
+        } else {
+          ws.authenticated = false;
+          ws.send(JSON.stringify({ t:'auth_status', authenticated: false, error: 'Mã PIN không đúng!' }));
+          addLog('⚠️ Phát hiện yêu cầu xác thực sai mã PIN');
+        }
+        return;
+      }
+
+      if (ws.role !== 'control') return; // overlays only listen
+
+      if (m && m.t === 'ctl') {
+        if (!ws.authenticated) {
+          ws.send(JSON.stringify({ t:'error', message: 'Bạn chưa nhập đúng mã PIN quản trị!' }));
+          return;
+        }
+        onControl(m);
+      }
+    } catch (e) {
+      addLog('Lệnh lỗi: ' + e.message);
+    }
   });
 });
 
@@ -447,9 +499,11 @@ function startServer(port, maxAttempts = 10) {
     const msg = `\n======================================================\n` +
       `  ZEN TEMPLE LIVE (CHÁNH ĐIỆN TỊNH TÂM PRO) ĐÃ KHỞI CHẠY!  \n` +
       `======================================================\n` +
-      `  • Cổng Server:       http://localhost:${activePort}\n` +
-      `  • Bảng Điều Khiển:   http://localhost:${activePort}/live/control.html\n` +
-      `  • Màn Hình Overlay:  http://localhost:${activePort}/live/overlay.html (1080x1920)\n` +
+      `  • Local Server:      http://localhost:${activePort}\n` +
+      `  • Local Control:     http://localhost:${activePort}/live/control.html\n` +
+      `  • Local Overlay:     http://localhost:${activePort}/live/overlay.html (1080x1920)\n` +
+      `  • Remote DDNS:       https://nhoxboo.changeip.co:8000/zen/live/control.html\n` +
+      `  • Mã PIN Quản Trị:   ${ADMIN_PIN}\n` +
       `======================================================\n`;
     console.log(msg);
     addLog(`Server chạy tại port ${activePort}`);
